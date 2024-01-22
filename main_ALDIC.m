@@ -4,7 +4,7 @@
 % 
 % Author: Jin Yang, PhD @Caltech
 % Contact and support: jyang526@wisc.edu -or- aldicdvc@gmail.com
-% Date: 2015.04,06,07; 2016.03,04; 2020.11;2021.12
+% Date: 2015.04,06,07; 2016.03,04; 2020.11
 % ---------------------------------------------
 
 %% Section 1: Clear MATLAB environment & mex set up Spline interpolation  
@@ -69,7 +69,7 @@ for ImgSeqNum = 2 : length(ImgNormalized)
     %%%%% initial guesses for other frames  
     if ImgSeqNum == 2
         DICpara.NewFFTSearch = 1; DICpara.InitFFTSearchMethod = [];
-    elseif ImgSeqNum < 7 
+    elseif ImgSeqNum < 7 || ImgSeqNum > DICpara.ImgSeqIncUnit
         DICpara.NewFFTSearch = 1; % Use FFT-based cross correlation to compute the initial guess
     else
         DICpara.NewFFTSearch = 0; % Apply data driven method to estimate initial guesses for later frames
@@ -77,7 +77,7 @@ for ImgSeqNum = 2 : length(ImgNormalized)
     %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
     
     %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-    if ImgSeqNum == 2 || DICpara.NewFFTSearch == 1 % Apply FFT-based cross correlation to compute the initial guess 
+    if ImgSeqNum == 2 || (DICpara.NewFFTSearch == 1 && mod(ImgSeqNum-2,DICpara.ImgSeqIncUnit) ~= 0) % Apply FFT-based cross correlation to compute the initial guess 
         
         % ====== Integer Search ======
         [DICpara,x0temp,y0temp,u,v,cc]= IntegerSearch(fNormalized,gNormalized,file_name,DICpara);
@@ -115,11 +115,33 @@ for ImgSeqNum = 2 : length(ImgNormalized)
         
     %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
     elseif mod(ImgSeqNum-2,DICpara.ImgSeqIncUnit) == 0 % To update ref image in incremental mode
-        fNormalizedNewIndex = ImgSeqNum-mod(ImgSeqNum-2,DICpara.ImgSeqIncUnit)-1;
-        if DICpara.ImgSeqIncUnit == 1,  fNormalizedNewIndex = fNormalizedNewIndex-1; end
+        fNormalizedNewIndex = ImgSeqNum-1; 
         fNormalized = ImgNormalized{fNormalizedNewIndex}; % Update reference
-        [DICpara,DICmesh] = ReadImageRefUpdate(file_name,ImgSeqNum,ResultDisp{ImgSeqNum-2}.U,DICpara,DICmesh); % Update reference image if needed;
-        U0 = zeros(2*size(DICmesh.coordinatesFEM,1),1); % PlotuvInit;
+        Df = funImgGradient(fNormalized,fNormalized);
+        [DICpara,~] = ReadImageRefUpdate(file_name,ImgSeqNum,ResultDisp{ImgSeqNum-2}.U,DICpara,DICmesh); % Update reference image if needed;
+        [DICpara,x0temp_f,y0temp_f,u_f,v_f,cc]= IntegerSearch(fNormalized,gNormalized,file_name,DICpara);
+        
+        % ====== FEM mesh set up ======
+        xnodes = max([1+0.5*DICpara.winsize+ DICpara.SizeOfFFTSearchRegion(1), DICpara.gridxyROIRange.gridx(1) ])  ...
+            : DICpara.winstepsize : min([size(fNormalized,1)-0.5*DICpara.winsize-1- DICpara.SizeOfFFTSearchRegion(1),DICpara.gridxyROIRange.gridx(2) ]);
+        ynodes = max([1+0.5*DICpara.winsize+ DICpara.SizeOfFFTSearchRegion(2),DICpara.gridxyROIRange.gridy(1) ])  ...
+            : DICpara.winstepsize : min([size(fNormalized,2)-0.5*DICpara.winsize-1- DICpara.SizeOfFFTSearchRegion(2),DICpara.gridxyROIRange.gridy(2) ]);
+         
+        [x0temp,y0temp] = ndgrid(xnodes,ynodes);   u_f_NotNanInd = find(~isnan(u_f(:)));
+         
+        op1 = rbfcreate( [x0temp_f(u_f_NotNanInd),y0temp_f(u_f_NotNanInd)]',[u_f(u_f_NotNanInd)]','RBFFunction', 'thinplate'); %rbfcheck(op1);
+        u = rbfinterp( [x0temp(:),y0temp(:)]', op1 );
+        op2 = rbfcreate( [x0temp_f(u_f_NotNanInd),y0temp_f(u_f_NotNanInd)]',[v_f(u_f_NotNanInd)]','RBFFunction', 'thinplate'); %rbfcheck(op2);
+        v = rbfinterp([x0temp(:),y0temp(:)]', op2 );
+        x0temp = x0temp'; y0temp = y0temp'; u=u'; v=v';
+        
+        %%%%% Do some regularization to further decrease the noise %%%%%
+        % u = regularizeNd([x0temp(:),y0temp(:)],u(:),{xnodes',ynodes'},1e-3);
+        % v = regularizeNd([x0temp(:),y0temp(:)],v(:),{xnodes',ynodes'},1e-3);
+        
+        [DICmesh] = MeshSetUp(x0temp,y0temp,DICpara); clear x0temp y0temp;
+        % ====== Initial Value ======
+        U0 = Init(u,v,cc.max,DICmesh.x0,DICmesh.y0,0); 
         ResultFEMesh{1+floor(fNormalizedNewIndex/DICpara.ImgSeqIncUnit)} = ... % To save first mesh info
             struct( 'coordinatesFEM',DICmesh.coordinatesFEM,'elementsFEM',DICmesh.elementsFEM, ...
             'winsize',DICpara.winsize,'winstepsize',DICpara.winstepsize,'gridxyROIRange',DICpara.gridxyROIRange );
@@ -445,6 +467,28 @@ for ImgSeqNum = 2 : length(ImgNormalized)
     
 end
 
+if DICpara.ImgSeqIncUnit < length(ImgNormalized) + 1
+     fprintf('------------ Getting accumulated displacement field ------------ \n \n')
+     Refcoodx=ResultFEMeshEachFrame{1, 1}.coordinatesFEM(:,1);
+     Refcoody=ResultFEMeshEachFrame{1, 1}.coordinatesFEM(:,2);
+     DefCoodx=ResultFEMeshEachFrame{1, 1}.coordinatesFEM(:,1);
+     DefCoody=ResultFEMeshEachFrame{1, 1}.coordinatesFEM(:,2);
+      for SeqNum = 1:length(ResultDisp)
+             DefCood{SeqNum}.x= DefCoodx;
+             DefCood{SeqNum}.y= DefCoody;
+             ResultInc2AccDisp{SeqNum,1}= zeros(length(ResultDisp{1, 1}.U),1);
+             xcoef=rbfcreate([ResultFEMeshEachFrame{SeqNum}.coordinatesFEM(:,1)';ResultFEMeshEachFrame{SeqNum}.coordinatesFEM(:,2)'], ResultDisp{SeqNum}.U(1:2:end)');
+             ycoef=rbfcreate([ResultFEMeshEachFrame{SeqNum}.coordinatesFEM(:,1)';ResultFEMeshEachFrame{SeqNum}.coordinatesFEM(:,2)'], ResultDisp{SeqNum}.U(2:2:end)');
+             xdef = rbfinterp([DefCoodx'; DefCoody'], xcoef);
+             ydef = rbfinterp([DefCoodx'; DefCoody'], ycoef);
+             ResultInc2AccDisp{SeqNum,1}(1:2:end)=DefCoodx-Refcoodx+xdef';
+             ResultInc2AccDisp{SeqNum,1}(2:2:end)=DefCoody-Refcoody+ydef';
+             if mod(SeqNum,DICpara.ImgSeqIncUnit) == 0 && SeqNum > 1 
+                 DefCoodx=DefCoodx+xdef';
+                 DefCoody=DefCoody+ydef';
+             end
+      end
+end
 
 % ------ Plot ------
 USubpb2World = USubpb2; USubpb2World(2:2:end) = -USubpb2(2:2:end); 
@@ -457,7 +501,12 @@ Plotstrain_show(FSubpb2World,DICmesh.coordinatesFEMWorld,DICmesh.elementsFEM);
 % Find img name and save all the results
 [~,imgname,imgext] = fileparts(file_name{1,end});
 results_name = ['results_',imgname,'_ws',num2str(DICpara.winsize),'_st',num2str(DICpara.winstepsize),'.mat'];
-save(results_name, 'file_name','DICpara','DICmesh','ResultDisp','ResultDefGrad','ResultFEMesh','ResultFEMeshEachFrame','ALSub1Time','ALSub2Time','ALSolveStep');
+if DICpara.ImgSeqIncUnit < length(ImgNormalized)+1 
+    save(results_name, 'file_name','DICpara','DICmesh','ResultDisp','ResultDefGrad','ResultFEMesh','ResultFEMeshEachFrame','ALSub1Time','ALSub2Time','ALSolveStep'...
+        ,'Refcoodx','Refcoody','ResultInc2AccDisp');
+else
+    save(results_name, 'file_name','DICpara','DICmesh','ResultDisp','ResultDefGrad','ResultFEMesh','ResultFEMeshEachFrame','ALSub1Time','ALSub2Time','ALSolveStep');
+end
 
 
 %% Section 7: Check convergence
@@ -553,9 +602,9 @@ for ImgSeqNum = 2 : length(ImgNormalized)
     
     %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
     fNormalizedNewIndex = ImgSeqNum-mod(ImgSeqNum-2,DICpara.ImgSeqIncUnit)-1;
-    if DICpara.ImgSeqIncUnit > 1
+    if DICpara.ImgSeqIncUnit ==  length(ImgNormalized)+1
         FEMeshIndLast = floor(fNormalizedNewIndex/DICpara.ImgSeqIncUnit);
-    elseif DICpara.ImgSeqIncUnit == 1
+    elseif DICpara.ImgSeqIncUnit >= 1
         FEMeshIndLast = floor(fNormalizedNewIndex/DICpara.ImgSeqIncUnit)-1;
     end
     FEMeshInd = FEMeshIndLast + 1;
@@ -567,15 +616,30 @@ for ImgSeqNum = 2 : length(ImgNormalized)
         if (ImgSeqNum-1 == 1) || (DICpara.ImgSeqIncROIUpdateOrNot==1), UFEMesh = 0*USubpb2; end
     else
         USubpb2 = ResultDisp{ImgSeqNum-1}.U;
-        if mod(ImgSeqNum-2,DICpara.ImgSeqIncUnit) == 0
-            coordinatesFEM = ResultFEMesh{FEMeshInd}.coordinatesFEM;
-            elementsFEM = ResultFEMesh{FEMeshInd}.elementsFEM;
-            coordinatesFEMLast = ResultFEMesh{FEMeshIndLast}.coordinatesFEM;
-            UFEMeshLast = ResultDisp{ImgSeqNum-2}.U + UFEMesh;
+         UFEMesh = 0*USubpb2;
+%         if mod(ImgSeqNum-2,DICpara.ImgSeqIncUnit) == 0
+%             coordinatesFEM = ResultFEMesh{FEMeshInd}.coordinatesFEM;
+%             elementsFEM = ResultFEMesh{FEMeshInd}.elementsFEM;
+%             coordinatesFEMLast = ResultFEMesh{FEMeshIndLast}.coordinatesFEM;
+%             UFEMeshLast = ResultDisp{ImgSeqNum-2}.U + UFEMesh;
+%             xq = coordinatesFEM(:,1); yq = coordinatesFEM(:,2);
+%             UFEMesh = 0*USubpb2;
+%             UFEMesh(1:2:end) = griddata(coordinatesFEMLast(:,1),coordinatesFEMLast(:,2),UFEMeshLast(1:2:end),xq,yq,'v4');
+%             UFEMesh(2:2:end) = griddata(coordinatesFEMLast(:,1),coordinatesFEMLast(:,2),UFEMeshLast(2:2:end),xq,yq,'v4');
+%         end
+% 
+        if DICpara.ImgSeqIncUnit < (length(ImgNormalized)+1) && (ImgSeqNum-1) > DICpara.ImgSeqIncUnit
+            UpdateRefIdx=0:DICpara.ImgSeqIncUnit:length(ResultDisp);
+            UpdateRefIdxLast=max(UpdateRefIdx(find(ImgSeqNum-1 >UpdateRefIdx)));
+            coordinatesFEM = ResultFEMeshEachFrame{ImgSeqNum-1}.coordinatesFEM;
             xq = coordinatesFEM(:,1); yq = coordinatesFEM(:,2);
-            UFEMesh = 0*USubpb2;
-            UFEMesh(1:2:end) = griddata(coordinatesFEMLast(:,1),coordinatesFEMLast(:,2),UFEMeshLast(1:2:end),xq,yq,'v4');
-            UFEMesh(2:2:end) = griddata(coordinatesFEMLast(:,1),coordinatesFEMLast(:,2),UFEMeshLast(2:2:end),xq,yq,'v4');
+%             xcoef=rbfcreate([DefCood{UpdateRefIdxLast}.x';DefCood{UpdateRefIdxLast}.y'],ResultInc2AccDisp{UpdateRefIdxLast}(1:2:end)');
+%             ycoef=rbfcreate([DefCood{UpdateRefIdxLast}.x';DefCood{UpdateRefIdxLast}.y'],ResultInc2AccDisp{UpdateRefIdxLast}(2:2:end)');
+%             UFEMesh(1:2:end) = rbfinterp([xq';yq'], xcoef);
+%             UFEMesh(2:2:end) = rbfinterp([xq';yq'], ycoef);
+            UFEMesh(1:2:end) = griddata(Refcoodx,Refcoody,ResultInc2AccDisp{ImgSeqNum-1}(1:2:end),xq,yq,'v4');
+            UFEMesh(2:2:end) = griddata(Refcoodx,Refcoody,ResultInc2AccDisp{ImgSeqNum-1}(2:2:end),xq,yq,'v4');
+            UFEMesh= UFEMesh- USubpb2;
         end
         USubpb2 = USubpb2 + UFEMesh;
     end
@@ -664,6 +728,13 @@ results_name = ['results_',imgname,'_ws',num2str(DICpara.winsize),'_st',num2str(
 save(results_name, 'file_name','DICpara','DICmesh','ResultDisp','ResultDefGrad','ResultFEMesh','ResultFEMeshEachFrame',...
     'ALSub1Time','ALSub2Time','ALSolveStep','ResultStrainWorld');
 
+if DICpara.ImgSeqIncUnit < length(ImgNormalized) 
+     save(results_name, 'file_name','DICpara','DICmesh','ResultDisp','ResultDefGrad','ResultFEMesh','ResultFEMeshEachFrame',...
+    'ALSub1Time','ALSub2Time','ALSolveStep','ResultStrainWorld','Refcoodx','Refcoody','ResultInc2AccDisp');
+else
+    save(results_name, 'file_name','DICpara','DICmesh','ResultDisp','ResultDefGrad','ResultFEMesh','ResultFEMeshEachFrame',...
+    'ALSub1Time','ALSub2Time','ALSolveStep','ResultStrainWorld');
+end
 
 
 %% Section 9: Compute stress
